@@ -36,6 +36,7 @@ from zoneinfo import ZoneInfo
 TZ = ZoneInfo("America/Chicago")
 HTTP_TIMEOUT = 25
 RSS_LIMIT = 5
+MAX_HTML = 240_000
 
 TO_EMAIL = "brian.overton@ymail.com"
 FROM_EMAIL = "brian.overton@ymail.com"
@@ -104,6 +105,13 @@ def strip_tags(text: str) -> str:
 
 def compact_text(text: str) -> str:
     return " ".join(strip_tags(text).split())
+
+
+def snapshot_text(text: str, limit: int = 650) -> str:
+    compact = compact_text(text)
+    if len(compact) <= limit:
+        return compact
+    return compact[:limit].rsplit(" ", 1)[0] + "..."
 
 
 def html_link(title: str, url: str) -> str:
@@ -504,7 +512,7 @@ def get_more_verses_same_book(book: str, count: int = 2) -> list[tuple[str, str]
         return results
 
     for chapter in range(1, 11):
-        url = f"{BIBLE_API_BASE}{urlquote(f'{book} {chapter}') }"
+        url = f"{BIBLE_API_BASE}{urlquote(f'{book} {chapter}')}"
         try:
             verses = (safe_json(http_get(url)).get("verses") or [])
         except Exception:
@@ -608,8 +616,8 @@ def fetch_whitehouse_headlines(limit: int = 18) -> list[str]:
                 unique.append(h)
         return unique
 
-    briefings = http_get(WHITEHOUSE_BRIEFINGS).decode("utf-8", errors="replace")
-    news = http_get(WHITEHOUSE_NEWS).decode("utf-8", errors="replace")
+    briefings = http_get(WHITEHOUSE_BRIEFINGS).decode("utf-8", errors="replace")[:MAX_HTML]
+    news = http_get(WHITEHOUSE_NEWS).decode("utf-8", errors="replace")[:MAX_HTML]
     return (extract(briefings) + extract(news))[:limit]
 
 
@@ -650,7 +658,7 @@ def render_news_themes_summary(headlines: list[tuple[str, str]]) -> str:
         return clean_llm_section("", "TODAY'S NEWS THEMES")
 
 
-def render_full_brief_summary(section_snapshots: list[tuple[str, str]]) -> str:
+def render_full_brief_summary(section_snapshots: list[tuple[str, str]], headlines: list[tuple[str, str]]) -> str:
     lines = []
     for name, content in section_snapshots:
         txt = compact_text(content)
@@ -673,9 +681,18 @@ def render_full_brief_summary(section_snapshots: list[tuple[str, str]]) -> str:
         + "\n".join(f"- {line}" for line in lines)
     )
     try:
-        return clean_llm_paragraph_section(ollama_generate(prompt, temperature=0.1), "GEMMA FULL BRIEF SUMMARY")
+        primary = clean_llm_paragraph_section(
+            ollama_generate(prompt, temperature=0.1),
+            "GEMMA FULL BRIEF SUMMARY",
+        )
+        plain = compact_text(primary)
+        if "Summary unavailable." in primary or len(plain) < 140:
+            fallback = render_news_themes_summary(headlines)
+            return clean_llm_paragraph_section(fallback, "GEMMA FULL BRIEF SUMMARY")
+        return primary
     except Exception:
-        return clean_llm_paragraph_section("", "GEMMA FULL BRIEF SUMMARY")
+        fallback = render_news_themes_summary(headlines) if headlines else ""
+        return clean_llm_paragraph_section(fallback, "GEMMA FULL BRIEF SUMMARY")
 
 
 # ----------------------------- Email ------------------------------ #
@@ -727,7 +744,7 @@ def build_html() -> str:
     except Exception as err:
         weather_html = section_error("Weather — Elk River, MN", err)
     blocks.append(weather_html)
-    summary_snapshots.append(("Weather", weather_html))
+    summary_snapshots.append(("Weather", snapshot_text(weather_html)))
     blocks.append("<hr>")
 
     log("Markets...")
@@ -736,13 +753,13 @@ def build_html() -> str:
     except Exception as err:
         markets_html = section_error("Markets", err)
     blocks.append(markets_html)
-    summary_snapshots.append(("Markets", markets_html))
+    summary_snapshots.append(("Markets", snapshot_text(markets_html)))
     blocks.append("<hr>")
 
     log("Calendar...")
     calendar_html = render_calendar_block()
     blocks.append(calendar_html)
-    summary_snapshots.append(("Calendar", calendar_html))
+    summary_snapshots.append(("Calendar", snapshot_text(calendar_html)))
     blocks.append("<hr>")
 
     log("Bible...")
@@ -751,13 +768,13 @@ def build_html() -> str:
     except Exception as err:
         bible_html = section_error("Bible", err)
     blocks.append(bible_html)
-    summary_snapshots.append(("Bible", bible_html))
+    summary_snapshots.append(("Bible", snapshot_text(bible_html)))
     blocks.append("<hr>")
 
     log("Sports...")
     sports_html = render_sports_block()
     blocks.append(sports_html)
-    summary_snapshots.append(("Sports", sports_html))
+    summary_snapshots.append(("Sports", snapshot_text(sports_html)))
     blocks.append("<hr>")
 
     log("Headlines...")
@@ -771,7 +788,9 @@ def build_html() -> str:
         all_headlines.extend(items)
         rss_snapshot.extend([f"{name}: {title} ({link})" for title, link in items])
 
-    summary_snapshots.append(("RSS Headlines", "\n".join(rss_snapshot) if rss_snapshot else "(none)"))
+    summary_snapshots.append(
+        ("RSS Headlines", snapshot_text("\n".join(rss_snapshot) if rss_snapshot else "(none)", limit=900))
+    )
     blocks.append("<hr>")
 
     log("POTUS/Admin summary...")
@@ -781,17 +800,19 @@ def build_html() -> str:
         wh_headlines = []
     potus_html = render_potus_summary(wh_headlines)
     blocks.append(potus_html)
-    summary_snapshots.append(("White House Headlines", "\n".join(wh_headlines) if wh_headlines else "(none)"))
+    summary_snapshots.append(
+        ("White House Headlines", snapshot_text("\n".join(wh_headlines) if wh_headlines else "(none)", limit=900))
+    )
     blocks.append("<hr>")
 
     log("News themes summary...")
     themes_html = render_news_themes_summary(all_headlines)
     blocks.append(themes_html)
-    summary_snapshots.append(("News Themes Summary", themes_html))
+    summary_snapshots.append(("News Themes Summary", snapshot_text(themes_html)))
     blocks.append("<hr>")
 
     log("Gemma full brief summary...")
-    blocks.append(render_full_brief_summary(summary_snapshots))
+    blocks.append(render_full_brief_summary(summary_snapshots, all_headlines))
     blocks.append("<hr>")
 
     style = """
