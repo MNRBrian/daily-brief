@@ -114,6 +114,26 @@ def snapshot_text(text: str, limit: int = 650) -> str:
     return compact[:limit].rsplit(" ", 1)[0] + "..."
 
 
+def deterministic_full_summary(section_snapshots: list[tuple[str, str]], title: str) -> str:
+    parts: list[str] = []
+    for name, content in section_snapshots:
+        txt = compact_text(content)
+        if not txt or txt == "(no data)":
+            continue
+        if "Summary unavailable." in txt:
+            continue
+        short = txt[:200].rsplit(" ", 1)[0].strip()
+        if short:
+            parts.append(f"{name}: {short}.")
+
+    if not parts:
+        return f"<h2>{html.escape(title)}</h2><p><i>Summary unavailable.</i></p>"
+
+    paragraph = " ".join(parts)
+    paragraph = re.sub(r"\s+", " ", paragraph).strip()
+    return f"<h2>{html.escape(title)}</h2>\n<p>{html.escape(paragraph)}</p>"
+
+
 def html_link(title: str, url: str) -> str:
     return f'<a href="{html.escape(url, quote=True)}">{html.escape(title)}</a>'
 
@@ -686,13 +706,20 @@ def render_full_brief_summary(section_snapshots: list[tuple[str, str]], headline
             "GEMMA FULL BRIEF SUMMARY",
         )
         plain = compact_text(primary)
-        if "Summary unavailable." in primary or len(plain) < 140:
-            fallback = render_news_themes_summary(headlines)
-            return clean_llm_paragraph_section(fallback, "GEMMA FULL BRIEF SUMMARY")
+        coverage_terms = ("weather", "market", "calendar", "bible", "sports", "headline", "white house")
+        coverage = sum(1 for term in coverage_terms if term in plain.lower())
+        if "Summary unavailable." in primary or len(plain) < 140 or coverage < 4:
+            return deterministic_full_summary(section_snapshots, "GEMMA FULL BRIEF SUMMARY")
+        if any(bad in plain.lower() for bad in ("military action", "election interference")):
+            return deterministic_full_summary(section_snapshots, "GEMMA FULL BRIEF SUMMARY")
         return primary
     except Exception:
-        fallback = render_news_themes_summary(headlines) if headlines else ""
-        return clean_llm_paragraph_section(fallback, "GEMMA FULL BRIEF SUMMARY")
+        if headlines:
+            fallback = render_news_themes_summary(headlines)
+            fallback_paragraph = clean_llm_paragraph_section(fallback, "GEMMA FULL BRIEF SUMMARY")
+            if "Summary unavailable." not in fallback_paragraph:
+                return fallback_paragraph
+        return deterministic_full_summary(section_snapshots, "GEMMA FULL BRIEF SUMMARY")
 
 
 # ----------------------------- Email ------------------------------ #
