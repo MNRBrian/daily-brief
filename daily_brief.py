@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Daily HTML email brief with deterministic data + Ollama summaries.
+Daily HTML email brief with deterministic data + Claude AI summaries.
 
 Deterministic:
 - Weather (NWS api.weather.gov)
@@ -10,7 +10,7 @@ Deterministic:
 - Sports (ESPN scoreboards, MN teams, last night)
 - Headlines (RSS)
 
-Ollama-only:
+Claude AI:
 - POTUS/Admin summary from WhiteHouse.gov headlines
 - News themes summary from collected headlines
 - Full brief wrap-up summary from all collected sections
@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import re
 import ssl
 import subprocess
@@ -29,6 +30,8 @@ from urllib.parse import quote as urlquote
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree as ET
 from zoneinfo import ZoneInfo
+
+import anthropic
 
 
 # ----------------------------- Config ----------------------------- #
@@ -42,8 +45,8 @@ TO_EMAIL = "brian.overton@ymail.com"
 FROM_EMAIL = "brian.overton@ymail.com"
 SUBJECT_PREFIX = "AI Daily Brief"
 
-OLLAMA_URL = "http://127.0.0.1:11434"
-OLLAMA_MODEL = "gemma3:latest"
+CLAUDE_MODEL = "claude-haiku-4-5-20251001"
+CLAUDE_KEY_FILE = "/root/.anthropic_api_key"
 
 WEATHER_LAT = 45.3036
 WEATHER_LON = -93.5672
@@ -151,25 +154,27 @@ def section_error(title: str, err: Exception) -> str:
     return f"<h2>{html.escape(title)}</h2><p><i>Failed:</i> {html.escape(str(err))}</p>"
 
 
-# ----------------------------- Ollama ----------------------------- #
+# ----------------------------- Claude AI -------------------------- #
 
-def ollama_generate(prompt: str, temperature: float = 0.3) -> str:
-    payload = {
-        "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "options": {"temperature": temperature, "top_p": 0.9},
-    }
-    req = Request(
-        f"{OLLAMA_URL}/api/generate",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
+def _load_api_key() -> str:
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if key:
+        return key
+    try:
+        with open(CLAUDE_KEY_FILE) as f:
+            return f.read().strip()
+    except Exception as err:
+        raise RuntimeError(f"No Anthropic API key found (set ANTHROPIC_API_KEY or {CLAUDE_KEY_FILE})") from err
+
+
+def claude_generate(prompt: str) -> str:
+    client = anthropic.Anthropic(api_key=_load_api_key())
+    message = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}],
     )
-    ctx = ssl.create_default_context()
-    with urlopen(req, timeout=240, context=ctx) as resp:
-        out = resp.read()
-    return (safe_json(out).get("response") or "").strip()
+    return (message.content[0].text or "").strip()
 
 
 def lines_to_ul(lines: list[str]) -> str:
@@ -638,7 +643,7 @@ def render_potus_summary(wh_headlines: list[str]) -> str:
         + "\n".join(f"- {h}" for h in wh_headlines[:18])
     )
     try:
-        return clean_llm_section(ollama_generate(prompt, temperature=0.15), "POTUS / ADMIN UPDATE")
+        return clean_llm_section(claude_generate(prompt), "POTUS / ADMIN UPDATE")
     except Exception:
         return clean_llm_section("", "POTUS / ADMIN UPDATE")
 
@@ -656,7 +661,7 @@ def render_news_themes_summary(headlines: list[tuple[str, str]]) -> str:
         + ("\n".join(f"- {title}" for title, url in headlines[:30]) if headlines else "- (none)")
     )
     try:
-        return clean_llm_section(ollama_generate(prompt, temperature=0.2), "TODAY'S NEWS THEMES")
+        return clean_llm_section(claude_generate(prompt), "TODAY'S NEWS THEMES")
     except Exception:
         return clean_llm_section("", "TODAY'S NEWS THEMES")
 
@@ -672,7 +677,7 @@ def render_full_brief_summary(section_snapshots: list[tuple[str, str]], headline
     prompt = (
         "Return HTML ONLY.\n"
         "Create exactly:\n"
-        "<h2>GEMMA FULL BRIEF SUMMARY</h2>\n"
+        "<h2>CLAUDE FULL BRIEF SUMMARY</h2>\n"
         "<p>...</p>\n\n"
         "Write one concise, action-oriented paragraph.\n"
         "Use ONLY provided data. No invented facts.\n"
@@ -685,24 +690,24 @@ def render_full_brief_summary(section_snapshots: list[tuple[str, str]], headline
     )
     try:
         primary = clean_llm_paragraph_section(
-            ollama_generate(prompt, temperature=0.1),
-            "GEMMA FULL BRIEF SUMMARY",
+            claude_generate(prompt),
+            "CLAUDE FULL BRIEF SUMMARY",
         )
         plain = compact_text(primary)
         coverage_terms = ("weather", "market", "calendar", "bible", "sports", "headline", "white house")
         coverage = sum(1 for term in coverage_terms if term in plain.lower())
         if "Summary unavailable." in primary or len(plain) < 140 or coverage < 4:
-            return deterministic_full_summary(section_snapshots, "GEMMA FULL BRIEF SUMMARY")
+            return deterministic_full_summary(section_snapshots, "CLAUDE FULL BRIEF SUMMARY")
         if any(bad in plain.lower() for bad in ("military action", "election interference")):
-            return deterministic_full_summary(section_snapshots, "GEMMA FULL BRIEF SUMMARY")
+            return deterministic_full_summary(section_snapshots, "CLAUDE FULL BRIEF SUMMARY")
         return primary
     except Exception:
         if headlines:
             fallback = render_news_themes_summary(headlines)
-            fallback_paragraph = clean_llm_paragraph_section(fallback, "GEMMA FULL BRIEF SUMMARY")
+            fallback_paragraph = clean_llm_paragraph_section(fallback, "CLAUDE FULL BRIEF SUMMARY")
             if "Summary unavailable." not in fallback_paragraph:
                 return fallback_paragraph
-        return deterministic_full_summary(section_snapshots, "GEMMA FULL BRIEF SUMMARY")
+        return deterministic_full_summary(section_snapshots, "CLAUDE FULL BRIEF SUMMARY")
 
 
 # ----------------------------- Email ------------------------------ #
