@@ -3,8 +3,8 @@
 Daily HTML email brief with deterministic data + Ollama summaries.
 
 Deterministic:
-- Weather (Open-Meteo)
-- Markets (Stooq + CoinGecko)
+- Weather (NWS api.weather.gov)
+- Markets (Yahoo Finance + CoinGecko)
 - Calendars (ICS)
 - Bible (BibleGateway VOTD + bible-api)
 - Sports (ESPN scoreboards, MN teams, last night)
@@ -47,7 +47,6 @@ OLLAMA_MODEL = "gemma3:latest"
 
 WEATHER_LAT = 45.3036
 WEATHER_LON = -93.5672
-WEATHER_TZ = "America/Chicago"
 
 CAL_O365 = "https://outlook.office365.com/owa/calendar/cad449d11c4c42c28cfb707c54bda628@mnrealtor.com/ed51571060f54e7e9764ef30eb168b9313742464364861286019/S-1-8-2812003574-1231967269-709150430-2363919127/reachcalendar.ics"
 CAL_GOOGLE = "https://calendar.google.com/calendar/ical/boverton%40northstarmls.com/public/basic.ics"
@@ -69,10 +68,10 @@ MN_TEAMS = {
 }
 
 ESPN_SCOREBOARD = {
-    "nba": "https://site.api.espn.com/apis/v2/sports/basketball/nba/scoreboard",
-    "nhl": "https://site.api.espn.com/apis/v2/sports/hockey/nhl/scoreboard",
-    "mlb": "https://site.api.espn.com/apis/v2/sports/baseball/mlb/scoreboard",
-    "nfl": "https://site.api.espn.com/apis/v2/sports/football/nfl/scoreboard",
+    "nba": "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
+    "nhl": "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard",
+    "mlb": "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard",
+    "nfl": "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard",
 }
 
 BIBLE_VOTD_ATOM = "https://www.biblegateway.com/votd/get/?format=atom"
@@ -122,6 +121,8 @@ def deterministic_full_summary(section_snapshots: list[tuple[str, str]], title: 
             continue
         if "Summary unavailable." in txt:
             continue
+        if "Failed:" in txt:
+            continue
         short = txt[:200].rsplit(" ", 1)[0].strip()
         if short:
             parts.append(f"{name}: {short}.")
@@ -144,12 +145,6 @@ def fmt_dt_local(value: datetime) -> str:
 
 def fmt_date_local(value: datetime) -> str:
     return value.astimezone(TZ).strftime("%A, %B %-d, %Y")
-
-
-def c_to_f(celsius: float | None) -> float | None:
-    if celsius is None:
-        return None
-    return celsius * 9 / 5 + 32
 
 
 def section_error(title: str, err: Exception) -> str:
@@ -230,76 +225,62 @@ def clean_llm_paragraph_section(text: str, title: str) -> str:
 
 # ----------------------------- Weather ---------------------------- #
 
-def get_weather_realtime() -> dict:
-    url = (
-        "https://api.open-meteo.com/v1/forecast"
-        f"?latitude={WEATHER_LAT}&longitude={WEATHER_LON}"
-        "&current_weather=true"
-        "&hourly=temperature_2m,precipitation_probability,wind_speed_10m"
-        "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
-        f"&timezone={WEATHER_TZ}"
-    )
-    return safe_json(http_get(url))
+def get_weather_nws() -> dict:
+    nws_headers = {"User-Agent": "daily-brief/2.0 (boverton@mnrealtor.com)", "Accept": "application/json"}
+    points = safe_json(http_get(
+        f"https://api.weather.gov/points/{WEATHER_LAT},{WEATHER_LON}",
+        headers=nws_headers,
+    ))
+    props = points.get("properties", {})
+    forecast = safe_json(http_get(props["forecast"], headers=nws_headers))
+    hourly = safe_json(http_get(props["forecastHourly"], headers=nws_headers))
+    return {"forecast": forecast, "hourly": hourly}
 
 
 def render_weather(weather: dict) -> str:
-    cur = weather.get("current_weather", {}) or {}
-    daily = weather.get("daily", {}) or {}
-    hourly = weather.get("hourly", {}) or {}
+    periods = (weather.get("forecast", {}).get("properties", {}).get("periods") or [])
+    hourly = (weather.get("hourly", {}).get("properties", {}).get("periods") or [])
+    now = datetime.now(TZ)
 
-    cur_temp_f = c_to_f(cur.get("temperature"))
-    tmax_f = c_to_f((daily.get("temperature_2m_max") or [None])[0])
-    tmin_f = c_to_f((daily.get("temperature_2m_min") or [None])[0])
-
-    out = ["<h2>Weather — Elk River, MN (real-time)</h2>", "<ul>"]
-    if cur.get("time"):
-        out.append(f"<li><b>As of:</b> {html.escape(cur['time'])} (local)</li>")
-    if cur_temp_f is not None:
-        out.append(f"<li><b>Now:</b> {cur_temp_f:.1f}°F</li>")
-    if tmin_f is not None and tmax_f is not None:
-        out.append(f"<li><b>Today:</b> {tmin_f:.1f}°F – {tmax_f:.1f}°F</li>")
-    if (pmax := (daily.get("precipitation_probability_max") or [None])[0]) is not None:
-        out.append(f"<li><b>Precip chance (max today):</b> {int(pmax)}%</li>")
-    if (wind := cur.get("windspeed")) is not None:
-        out.append(f"<li><b>Wind:</b> {wind:.0f} km/h</li>")
-    if (code := cur.get("weathercode")) is not None:
-        out.append(f"<li><b>Weather code:</b> {code}</li>")
+    out = ["<h2>Weather — Elk River, MN</h2>", "<ul>"]
+    for period in periods[:2]:
+        name = period.get("name", "")
+        temp = period.get("temperature")
+        unit = period.get("temperatureUnit", "F")
+        wind_speed = period.get("windSpeed", "")
+        wind_dir = period.get("windDirection", "")
+        short = period.get("shortForecast", "")
+        if temp is not None:
+            wind = f"{wind_speed} {wind_dir}".strip()
+            out.append(
+                f"<li><b>{html.escape(name)}:</b> {temp}°{unit} — "
+                f"{html.escape(short)}, Wind: {html.escape(wind)}</li>"
+            )
     out.append("</ul>")
 
-    now = datetime.now(TZ)
     rows = []
-    h_times = hourly.get("time") or []
-    h_temps = hourly.get("temperature_2m") or []
-    h_pop = hourly.get("precipitation_probability") or []
-    h_wind = hourly.get("wind_speed_10m") or []
-
-    for i, ts in enumerate(h_times):
+    for period in hourly:
+        start = period.get("startTime", "")
         try:
-            dth = datetime.fromisoformat(ts).replace(tzinfo=TZ)
+            dth = datetime.fromisoformat(start).astimezone(TZ)
         except Exception:
             continue
         if dth < now:
             continue
-        rows.append((
-            dth,
-            c_to_f(h_temps[i]) if i < len(h_temps) else None,
-            h_pop[i] if i < len(h_pop) else None,
-            h_wind[i] if i < len(h_wind) else None,
-        ))
+        rows.append((dth, period.get("temperature"), period.get("temperatureUnit", "F"), period.get("shortForecast", "")))
         if len(rows) >= 3:
             break
 
     if rows:
         out.append("<h3>Next few hours</h3>")
         out.append('<table border="1" cellpadding="6" cellspacing="0">')
-        out.append("<tr><th>Time</th><th>Temp (°F)</th><th>Precip %</th><th>Wind (km/h)</th></tr>")
-        for dth, tf, pop, wind in rows:
+        out.append("<tr><th>Time</th><th>Temp</th><th>Conditions</th></tr>")
+        for dth, temp, unit, short in rows:
             out.append(
                 "<tr>"
                 f"<td>{html.escape(dth.strftime('%-I:%M %p'))}</td>"
-                f"<td>{'' if tf is None else f'{tf:.1f}'}</td>"
-                f"<td>{'' if pop is None else int(pop)}</td>"
-                f"<td>{'' if wind is None else f'{wind:.0f}'}</td>"
+                f"<td>{temp}°{unit}</td>"
+                f"<td>{html.escape(short)}</td>"
                 "</tr>"
             )
         out.append("</table>")
@@ -309,17 +290,18 @@ def render_weather(weather: dict) -> str:
 
 # ----------------------------- Markets ---------------------------- #
 
-def stooq_last(symbol: str) -> float | None:
-    url = f"https://stooq.com/q/l/?s={urlquote(symbol)}&f=sd2t2ohlcv&h&e=csv"
-    lines = http_get(url).decode("utf-8", errors="replace").strip().splitlines()
-    if len(lines) < 2:
+def yahoo_last(symbol: str) -> float | None:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{urlquote(symbol)}"
+    result = (
+        safe_json(http_get(url, headers={"User-Agent": "Mozilla/5.0"}))
+        .get("chart", {})
+        .get("result") or []
+    )
+    if not result:
         return None
-    keys = lines[0].split(",")
-    vals = lines[1].split(",")
-    close = dict(zip(keys, vals)).get("Close") or ""
+    price = (result[0].get("meta") or {}).get("regularMarketPrice")
     try:
-        value = float(close)
-        return None if value == 0.0 else value
+        return float(price) if price is not None else None
     except Exception:
         return None
 
@@ -339,8 +321,8 @@ def get_xrp_usd() -> tuple[float | None, float | None]:
 
 
 def render_markets() -> str:
-    ndq = stooq_last("^ndq")
-    dji = stooq_last("^dji")
+    ndq = yahoo_last("^IXIC")
+    dji = yahoo_last("^DJI")
     xrp_price, xrp_change = get_xrp_usd()
 
     out = ["<h2>Markets</h2>", "<ul>"]
@@ -531,20 +513,19 @@ def get_more_verses_same_book(book: str, count: int = 2) -> list[tuple[str, str]
     if not book:
         return results
 
-    for chapter in range(1, 11):
-        url = f"{BIBLE_API_BASE}{urlquote(f'{book} {chapter}')}"
-        try:
-            verses = (safe_json(http_get(url)).get("verses") or [])
-        except Exception:
-            continue
+    url = f"{BIBLE_API_BASE}{urlquote(f'{book} 1')}"
+    try:
+        verses = (safe_json(http_get(url)).get("verses") or [])
+    except Exception:
+        return results
 
-        for verse in verses:
-            ref = f"{verse.get('book_name','')} {verse.get('chapter','')}:{verse.get('verse','')}".strip()
-            text = " ".join((verse.get("text") or "").split())
-            if ref and text:
-                results.append((ref, text))
-            if len(results) >= count:
-                return results
+    for verse in verses:
+        ref = f"{verse.get('book_name','')} {verse.get('chapter','')}:{verse.get('verse','')}".strip()
+        text = " ".join((verse.get("text") or "").split())
+        if ref and text:
+            results.append((ref, text))
+        if len(results) >= count:
+            break
     return results[:count]
 
 
@@ -650,8 +631,9 @@ def render_potus_summary(wh_headlines: list[str]) -> str:
         "Create exactly:\n"
         "<h2>POTUS / ADMIN UPDATE</h2>\n"
         "<ul><li>...</li></ul>\n\n"
-        "Use ONLY these WhiteHouse.gov headlines. Do NOT invent facts.\n"
-        "Write 4-8 short bullets.\n\n"
+        "Group these headlines into 4-8 bullets by topic.\n"
+        "For each bullet, write one sentence describing what the administration did or announced — not just the title.\n"
+        "Be factual and concise. Do NOT invent details beyond what the headlines imply.\n\n"
         "Headlines:\n"
         + "\n".join(f"- {h}" for h in wh_headlines[:18])
     )
@@ -667,10 +649,11 @@ def render_news_themes_summary(headlines: list[tuple[str, str]]) -> str:
         "Create exactly:\n"
         "<h2>TODAY'S NEWS THEMES</h2>\n"
         "<ul><li>...</li></ul>\n\n"
-        "Use ONLY these headlines. Do NOT invent facts.\n"
-        "Write 3-6 bullets.\n\n"
+        "Identify 3-6 major themes across these headlines.\n"
+        "For each theme, write one sentence describing the pattern or story — not just a headline title.\n"
+        "Do NOT invent facts not present in the headlines.\n\n"
         "Headlines:\n"
-        + ("\n".join(f"- {title} — {url}" for title, url in headlines[:30]) if headlines else "- (none)")
+        + ("\n".join(f"- {title}" for title, url in headlines[:30]) if headlines else "- (none)")
     )
     try:
         return clean_llm_section(ollama_generate(prompt, temperature=0.2), "TODAY'S NEWS THEMES")
@@ -767,7 +750,7 @@ def build_html() -> str:
 
     log("Weather...")
     try:
-        weather_html = render_weather(get_weather_realtime())
+        weather_html = render_weather(get_weather_nws())
     except Exception as err:
         weather_html = section_error("Weather — Elk River, MN", err)
     blocks.append(weather_html)
