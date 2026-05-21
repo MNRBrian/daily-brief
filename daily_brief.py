@@ -167,13 +167,16 @@ def _load_api_key() -> str:
         raise RuntimeError(f"No Anthropic API key found (set ANTHROPIC_API_KEY or {CLAUDE_KEY_FILE})") from err
 
 
-def claude_generate(prompt: str) -> str:
+def claude_generate(prompt: str, system: str | None = None) -> str:
     client = anthropic.Anthropic(api_key=_load_api_key())
-    message = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=1024,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    kwargs: dict = {
+        "model": CLAUDE_MODEL,
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if system:
+        kwargs["system"] = system
+    message = client.messages.create(**kwargs)
     return (message.content[0].text or "").strip()
 
 
@@ -667,47 +670,64 @@ def render_news_themes_summary(headlines: list[tuple[str, str]]) -> str:
 
 
 def render_full_brief_summary(section_snapshots: list[tuple[str, str]], headlines: list[tuple[str, str]]) -> str:
-    lines = []
-    for name, content in section_snapshots:
-        txt = compact_text(content)
-        if not txt:
-            txt = "(no data)"
-        lines.append(f"[{name}] {txt[:2500]}")
+    data_block = "\n".join(
+        f"[{name}] {compact_text(content)[:2500] or '(no data)'}"
+        for name, content in section_snapshots
+    )
+
+    system = (
+        "You are a personal daily briefing assistant writing a tight wrap-up paragraph. "
+        "Every sentence must cite actual facts, numbers, or names from the brief data provided. "
+        "Never write generic filler like 'check the weather' or 'stay informed'. "
+        "If a section has no data, skip it rather than padding the paragraph."
+    )
 
     prompt = (
-        "Return HTML ONLY.\n"
-        "Create exactly:\n"
+        "Return HTML ONLY — no markdown, no code fences.\n"
+        "Output this exact structure and nothing else:\n"
         "<h2>CLAUDE FULL BRIEF SUMMARY</h2>\n"
-        "<p>...</p>\n\n"
-        "Write one concise, action-oriented paragraph.\n"
-        "Use ONLY provided data. No invented facts.\n"
-        "Focus on what to do in the next 24 hours.\n"
-        "Include clear priorities and specific next actions in plain language.\n"
-        "If data is missing, include that as a brief watch-out sentence.\n"
-        "Do not use bullet points, line breaks, or tag prefixes like [NOW]/[TODAY]/[WATCH].\n\n"
-        "Section data:\n"
-        + "\n".join(f"- {line}" for line in lines)
+        "<p>[your paragraph]</p>\n\n"
+        "Write one paragraph of 3-5 sentences that synthesizes today's brief:\n"
+        "- Open with the single most pressing item (weather event, top headline, or urgent calendar item)\n"
+        "- Mention specific values: temperatures, market points/%, game scores, or named headlines\n"
+        "- Call out any calendar deadlines or appointments that need action today\n"
+        "- Close with one concrete priority for the next 24 hours\n"
+        "- No bullet points or line breaks inside the paragraph\n\n"
+        "Brief data:\n"
+        + data_block
     )
+
+    def _is_valid(html_text: str) -> bool:
+        plain = compact_text(html_text)
+        if len(plain) < 200:
+            return False
+        vague = ("summary unavailable", "check the weather", "stay informed", "keep an eye", "no data available")
+        return not any(p in plain.lower() for p in vague)
+
     try:
-        primary = clean_llm_paragraph_section(
-            claude_generate(prompt),
-            "CLAUDE FULL BRIEF SUMMARY",
-        )
-        plain = compact_text(primary)
-        coverage_terms = ("weather", "market", "calendar", "bible", "sports", "headline", "white house")
-        coverage = sum(1 for term in coverage_terms if term in plain.lower())
-        if "Summary unavailable." in primary or len(plain) < 140 or coverage < 4:
-            return deterministic_full_summary(section_snapshots, "CLAUDE FULL BRIEF SUMMARY")
-        if any(bad in plain.lower() for bad in ("military action", "election interference")):
-            return deterministic_full_summary(section_snapshots, "CLAUDE FULL BRIEF SUMMARY")
-        return primary
+        result = clean_llm_paragraph_section(claude_generate(prompt, system=system), "CLAUDE FULL BRIEF SUMMARY")
+        if _is_valid(result):
+            return result
     except Exception:
-        if headlines:
-            fallback = render_news_themes_summary(headlines)
-            fallback_paragraph = clean_llm_paragraph_section(fallback, "CLAUDE FULL BRIEF SUMMARY")
-            if "Summary unavailable." not in fallback_paragraph:
-                return fallback_paragraph
-        return deterministic_full_summary(section_snapshots, "CLAUDE FULL BRIEF SUMMARY")
+        pass
+
+    # Retry with a stripped-down prompt before falling back to deterministic
+    try:
+        retry = (
+            "HTML only. No markdown.\n"
+            "<h2>CLAUDE FULL BRIEF SUMMARY</h2>\n"
+            "<p>Write 3-4 sentences using specific numbers and names from the data below. "
+            "Cover weather, markets, top news, and any calendar items. "
+            "End with one priority action for today.</p>\n\n"
+            "Data:\n" + data_block
+        )
+        result = clean_llm_paragraph_section(claude_generate(retry), "CLAUDE FULL BRIEF SUMMARY")
+        if _is_valid(result):
+            return result
+    except Exception:
+        pass
+
+    return deterministic_full_summary(section_snapshots, "CLAUDE FULL BRIEF SUMMARY")
 
 
 # ----------------------------- Email ------------------------------ #
@@ -826,7 +846,7 @@ def build_html() -> str:
     summary_snapshots.append(("News Themes Summary", snapshot_text(themes_html)))
     blocks.append("<hr>")
 
-    log("Gemma full brief summary...")
+    log("Full brief summary...")
     blocks.append(render_full_brief_summary(summary_snapshots, all_headlines))
     blocks.append("<hr>")
 
