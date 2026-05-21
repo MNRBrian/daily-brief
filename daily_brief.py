@@ -22,9 +22,11 @@ import html
 import json
 import os
 import re
+import smtplib
 import ssl
-import subprocess
 from dataclasses import dataclass
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from datetime import datetime, timedelta
 from urllib.parse import quote as urlquote
 from urllib.request import Request, urlopen
@@ -46,7 +48,12 @@ FROM_EMAIL = "brian.overton@ymail.com"
 SUBJECT_PREFIX = "AI Daily Brief"
 
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
-CLAUDE_KEY_FILE = "/root/.anthropic_api_key"
+CLAUDE_KEY_FILE = "/run/secrets/anthropic_api_key"
+
+SMTP_HOST = "smtp.mail.yahoo.com"
+SMTP_PORT = 587
+SMTP_USER = FROM_EMAIL
+SMTP_PASS_FILE = "/run/secrets/yahoo_app_password"
 
 WEATHER_LAT = 45.3036
 WEATHER_LON = -93.5672
@@ -733,29 +740,26 @@ def render_full_brief_summary(section_snapshots: list[tuple[str, str]], headline
 # ----------------------------- Email ------------------------------ #
 
 def send_email_html(to_email: str, subject: str, html_body: str) -> None:
-    message = "\n".join([
-        f"From: {FROM_EMAIL}",
-        f"To: {to_email}",
-        f"Subject: {subject}",
-        "MIME-Version: 1.0",
-        'Content-Type: text/html; charset="utf-8"',
-        "",
-        html_body,
-    ]).encode("utf-8", errors="replace")
+    smtp_pass = os.environ.get("SMTP_PASSWORD")
+    if not smtp_pass:
+        try:
+            with open(SMTP_PASS_FILE) as f:
+                smtp_pass = f.read().strip()
+        except Exception as err:
+            raise RuntimeError(f"No SMTP password found ({SMTP_PASS_FILE})") from err
 
-    log("Sending email via /usr/sbin/sendmail...")
-    result = subprocess.run(
-        ["/usr/sbin/sendmail", "-t", "-i"],
-        input=message,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"sendmail failed ({result.returncode}): "
-            f"{result.stderr.decode('utf-8', errors='replace')}"
-        )
+    msg = MIMEMultipart("alternative")
+    msg["From"] = FROM_EMAIL
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    log("Sending email via Yahoo SMTP...")
+    ctx = ssl.create_default_context()
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.starttls(context=ctx)
+        server.login(SMTP_USER, smtp_pass)
+        server.sendmail(FROM_EMAIL, to_email, msg.as_string())
     log("Email sent.")
 
 
